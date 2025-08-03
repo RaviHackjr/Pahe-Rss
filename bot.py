@@ -3,7 +3,7 @@
 """
 AnimePahe RSS Feed Generator with Multi-Quality Support
 Generates an RSS feed for the latest 25 anime releases from AnimePahe with 360p, 720p, and 1080p links
-Designed for Koyeb deployment with auto-updates every 10-30 seconds, maintaining 25 items with newest at top
+Designed for Koyeb deployment with auto-updates every 30-60 seconds, maintaining 25 items with newest at top
 """
 import logging
 import os
@@ -13,6 +13,8 @@ import random
 import asyncio
 import json
 import threading
+import aiohttp
+import requests
 from datetime import datetime, timezone
 import pytz
 from pathlib import Path
@@ -22,7 +24,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import xml.etree.ElementTree as ET
 import cloudscraper
 from flask import Flask, send_file, Response
-from fake_useragent import UserAgent
 
 # Configure logging
 logging.basicConfig(
@@ -38,17 +39,14 @@ logger = logging.getLogger(__name__)
 # Flask app setup
 app = Flask(__name__)
 
-# Initialize UserAgent for random browser headers
-ua = UserAgent()
-
-# Base headers
-BASE_HEADERS = {
+# Headers for requests (from working bot)
+HEADERS = {
     'authority': 'animepahe.ru',
     'accept': 'application/json, text/javascript, */*; q=0.01',
     'accept-language': 'en-US,en;q=0.9',
-    'accept-encoding': 'gzip, deflate, br',
+    'cookie': '__ddg2_=;',
     'dnt': '1',
-    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="129", "Chromium";v="129"',
+    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="124", "Chromium";v="124"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
@@ -56,6 +54,7 @@ BASE_HEADERS = {
     'sec-fetch-site': 'same-origin',
     'x-requested-with': 'XMLHttpRequest',
     'referer': 'https://animepahe.ru/',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 }
 
 # Configuration
@@ -63,8 +62,8 @@ BASE_DIR = Path(__file__).parent.resolve()
 RSS_FILE = BASE_DIR / "animepahe_feed.xml"
 CACHE_FILE = BASE_DIR / "animepahe_cache.json"
 QUALITY_PREFERENCES = ["360p", "720p", "1080p"]
-UPDATE_INTERVAL_MIN = 10  # seconds
-UPDATE_INTERVAL_MAX = 30  # seconds
+UPDATE_INTERVAL_MIN = 30  # seconds (increased to avoid rate limits)
+UPDATE_INTERVAL_MAX = 60  # seconds
 MAX_ITEMS = 25  # Maximum number of items in RSS feed
 
 # Create directories
@@ -73,26 +72,25 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 # Store previous releases to detect new episodes
 previous_releases = set()
 
-# Create cloudscraper session with cookies
-def create_scraper_session():
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-        interpreter='nodejs'
-    )
-    headers = BASE_HEADERS.copy()
-    headers['user-agent'] = ua.random
-    try:
-        # Visit multiple pages to simulate a browser session
-        for url in ["https://animepahe.ru/", "https://animepahe.ru/anime"]:
-            response = scraper.get(url, headers=headers)
-            response.raise_for_status()
-            logger.info(f"Initialized scraper session with cookies from {url}")
-            time.sleep(random.uniform(1, 3))  # Simulate human-like delay
-    except Exception as e:
-        logger.error(f"Failed to initialize scraper session for {url}: {str(e)}")
-    return scraper
+# Global session with proper cookie handling
+session = None
 
-scraper = create_scraper_session()
+def create_session():
+    """Create a requests session with proper headers and cookies"""
+    global session
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    # Initialize session by visiting the main page
+    try:
+        response = session.get("https://animepahe.ru/")
+        response.raise_for_status()
+        logger.info("Session initialized successfully")
+        time.sleep(random.uniform(2, 4))  # Respectful delay
+    except Exception as e:
+        logger.error(f"Failed to initialize session: {str(e)}")
+    
+    return session
 
 def load_cached_releases():
     """Load cached releases from disk if available"""
@@ -116,183 +114,353 @@ def save_cached_releases(releases):
         logger.error(f"Error saving cache: {str(e)}")
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=20),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 async def search_anime(query: str) -> list:
+    """Search for anime using the API"""
     search_url = f"https://animepahe.ru/api?m=search&q={quote(query)}"
-    headers = BASE_HEADERS.copy()
-    headers['user-agent'] = ua.random
-    try:
-        response = scraper.get(search_url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        logger.info(f"Search successful for query: {query}")
-        return data.get('data', [])
-    except Exception as e:
-        logger.error(f"Search failed for query {query}: {str(e)}")
-        if isinstance(e, requests.exceptions.HTTPError):
-            logger.error(f"Response content: {e.response.text[:500]}")
-        raise
+    
+    async with aiohttp.ClientSession() as aio_session:
+        try:
+            async with aio_session.get(search_url, headers=HEADERS) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if data.get('total', 0) == 0:
+                    return []
+                
+                logger.info(f"Search successful for query: {query}")
+                return data.get('data', [])
+        except Exception as e:
+            logger.error(f"Search failed for query {query}: {str(e)}")
+            raise
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=20),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 async def get_episode_list(session_id: str, page: int = 1) -> dict:
+    """Get episode list for an anime"""
     episodes_url = f"https://animepahe.ru/api?m=release&id={session_id}&sort=episode_asc&page={page}"
-    headers = BASE_HEADERS.copy()
-    headers['user-agent'] = ua.random
-    try:
-        response = scraper.get(episodes_url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        logger.info(f"Retrieved episode list for session {session_id}, page {page}")
-        return data
-    except Exception as e:
-        logger.error(f"Failed to get episode list for session {session_id}: {str(e)}")
-        if isinstance(e, requests.exceptions.HTTPError):
-            logger.error(f"Response content: {e.response.text[:500]}")
-        raise
+    
+    async with aiohttp.ClientSession() as aio_session:
+        try:
+            async with aio_session.get(episodes_url, headers=HEADERS) as response:
+                response.raise_for_status()
+                data = await response.json()
+                logger.info(f"Retrieved episode list for session {session_id}, page {page}")
+                return data
+        except Exception as e:
+            logger.error(f"Failed to get episode list for session {session_id}: {str(e)}")
+            raise
+
+def step_2(s, seperator, base=10):
+    """Helper function for kwik link extraction"""
+    mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+    numbers = mapped_range[0:base]
+    max_iter = 0
+    for index, value in enumerate(s[::-1]):
+        max_iter += int(value if value.isdigit() else 0) * (seperator**index)
+    mid = ''
+    while max_iter > 0:
+        mid = numbers[int(max_iter % base)] + mid
+        max_iter = (max_iter - (max_iter % base)) / base
+    return mid or '0'
+
+def step_1(data, key, load, seperator):
+    """Helper function for kwik link extraction"""
+    payload = ""
+    i = 0
+    seperator = int(seperator)
+    load = int(load)
+    while i < len(data):
+        s = ""
+        while data[i] != key[seperator]:
+            s += data[i]
+            i += 1
+        for index, value in enumerate(key):
+            s = s.replace(value, str(index))
+        payload += chr(int(step_2(s, seperator, 10)) - load)
+        i += 1
+    payload = re.findall(
+        r'action="([^\"]+)" method="POST"><input type="hidden" name="_token"\s+value="([^\"]+)', payload
+    )[0]
+    return payload
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=20),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 def get_download_links(anime_session, episode_session):
+    """Get download links for an episode"""
+    global session
+    if session is None:
+        session = create_session()
+    
     if '-' in episode_session:
         episode_url = f"https://animepahe.ru/play/{episode_session}"
     else:
         episode_url = f"https://animepahe.ru/play/{anime_session}/{episode_session}"
     
-    time.sleep(random.uniform(2, 5))
-    local_headers = {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': ua.random,
-        'Referer': 'https://animepahe.ru/'
-    }
-    logger.info(f"Fetching episode page: {episode_url}")
-    response = scraper.get(episode_url, headers=local_headers)
-    response.raise_for_status()
-    
-    for parser in ['lxml', 'html.parser', 'html5lib']:
-        try:
-            soup = BeautifulSoup(response.content, parser)
-            break
-        except Exception as e:
-            logger.warning(f"Parser {parser} failed: {str(e)}")
-            continue
-    
-    links = []
-    selectors = [
-        "#pickDownload a.dropdown-item",
-        "#downloadMenu a",
-        "a[download]",
-        "a.btn-download",
-        "a[href*='download']",
-        ".download-wrapper a"
-    ]
-    
-    for selector in selectors:
-        elements = soup.select(selector)
-        if elements:
-            logger.info(f"Found {len(elements)} links with selector: {selector}")
-            for element in elements:
-                href = element.get('href') or element.get('data-url') or element.get('data-href')
-                if href:
+    try:
+        # Add random delay to avoid rate limiting
+        time.sleep(random.uniform(3, 6))
+        
+        local_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
+        session.headers.update(local_headers)
+        
+        logger.info(f"Fetching episode page: {episode_url}")
+        response = session.get(episode_url)
+        response.raise_for_status()
+        
+        for parser in ['lxml', 'html.parser', 'html5lib']:
+            try:
+                soup = BeautifulSoup(response.content, parser)
+                break
+            except:
+                continue
+        
+        links = []
+        
+        selectors = [
+            "#pickDownload a.dropdown-item",
+            "#downloadMenu a",
+            "a[download]",
+            "a.btn-download",
+            "a[href*='download']",
+            ".download-wrapper a"
+        ]
+        
+        for selector in selectors:
+            elements = soup.select(selector)
+            if elements:
+                logger.info(f"Found {len(elements)} links with selector: {selector}")
+                for element in elements:
+                    href = element.get('href') or element.get('data-url') or element.get('data-href')
+                    if href:
+                        if not href.startswith('http'):
+                            href = f"https://animepahe.ru{href}"
+                        links.append({
+                            'text': element.get_text(strip=True),
+                            'href': href
+                        })
+        
+        if not links:
+            # Fallback search
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                text = a.get_text(strip=True)
+                if any(keyword in href.lower() or keyword in text.lower() 
+                      for keyword in ['download', 'kwik.si', 'video', 'player']):
                     if not href.startswith('http'):
                         href = f"https://animepahe.ru{href}"
                     links.append({
-                        'text': element.get_text(strip=True),
+                        'text': text or 'Download',
                         'href': href
                     })
-    
-    if links:
-        logger.info(f"Found {len(links)} download links")
-        return links
-    logger.error(f"No download links found for episode {episode_url}")
-    return None
+        
+        if links:
+            logger.info(f"Found {len(links)} download links")
+            return links
+        
+        logger.error(f"No download links found for episode {episode_url}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting download links: {str(e)}")
+        # Recreate session on error
+        session = create_session()
+        raise
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=20),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 def extract_kwik_link(url):
-    local_headers = {
-        'User-Agent': ua.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://animepahe.ru/'
-    }
+    """Extract kwik.si link from download page"""
+    global session
+    if session is None:
+        session = create_session()
     
-    response = scraper.get(url, headers=local_headers)
-    response.raise_for_status()
-    
-    for parser in ['lxml', 'html.parser', 'html5lib']:
-        try:
-            soup = BeautifulSoup(response.text, parser)
-            break
-        except Exception as e:
-            logger.warning(f"Parser {parser} failed: {str(e)}")
-            continue
-    
-    # Broader search for kwik.si links
-    page_text = str(soup)
-    matches = re.findall(r'https://kwik\.si/f/[\w\d-]+', page_text)
-    if matches:
-        logger.info(f"Found kwik link: {matches[0]}")
-        return matches[0]
-    
-    for script in soup.find_all('script'):
-        if script.string:
-            match = re.search(r'https://kwik\.si/f/[\w\d-]+', script.string)
+    try:
+        # Add random delay
+        time.sleep(random.uniform(2, 4))
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'Referer': 'https://animepahe.ru/'
+        }
+        
+        response = session.get(url, headers=headers)
+        response.raise_for_status()
+        
+        logger.info(f"Got response from {url}, status code: {response.status_code}")
+        
+        for parser in ['lxml', 'html.parser', 'html5lib']:
+            try:
+                soup = BeautifulSoup(response.text, parser)
+                break
+            except Exception as e:
+                logger.warning(f"Parser {parser} failed: {str(e)}")
+                continue
+        
+        # Look for the kwik link in script tags
+        for script in soup.find_all('script'):
+            if script.string:
+                match = re.search(r'https://kwik\.si/f/[\w\d-]+', script.string)
+                if match:
+                    return match.group(0)
+        
+        # Look for download elements
+        download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"]')
+        for element in download_elements:
+            href = element.get('href') or element.get('onclick', '')
+            match = re.search(r'https://kwik\.si/f/[\w\d-]+', href)
             if match:
-                logger.info(f"Found kwik link in script: {match.group(0)}")
                 return match.group(0)
-    
-    download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"], a[data-src*="kwik.si"]')
-    for element in download_elements:
-        href = element.get('href') or element.get('onclick') or element.get('data-src', '')
-        match = re.search(r'https://kwik\.si/f/[\w\d-]+', href)
-        if match:
-            logger.info(f"Found kwik link in element: {match.group(0)}")
-            return match.group(0)
-    
-    logger.error(f"No kwik link found for {url}")
-    return None
+        
+        # Look in the whole page text
+        page_text = str(soup)
+        matches = re.findall(r'https://kwik\.si/f/[\w\d-]+', page_text)
+        if matches:
+            return matches[0]
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting kwik link: {str(e)}")
+        raise
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=20),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
+    reraise=True
+)
+def get_dl_link(link):
+    """Get direct download link from kwik.si"""
+    global session
+    if session is None:
+        session = create_session()
+    
+    try:
+        # Add random delay to avoid rate limiting
+        time.sleep(random.uniform(2, 4))
+        
+        # Use cloudscraper for better compatibility
+        scraper = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+            interpreter='nodejs'
+        )
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        # First, get the main page to establish session
+        scraper.get("https://animepahe.ru/", headers=headers)
+        
+        # Now get the actual link
+        resp = scraper.get(link, headers=headers)
+        
+        # Try different patterns to extract the parameters
+        patterns = [
+            r'\("([^"]+)",(\d+),"([^"]+)",(\d+),(\d+)',
+            r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
+        ]
+        
+        match = None
+        for pattern in patterns:
+            match = re.search(pattern, resp.text)
+            if match:
+                break
+        
+        if not match:
+            logger.error(f"Could not find required pattern in response from {link}")
+            return None
+        
+        # Extract parameters based on the pattern matched
+        if len(match.groups()) == 5:
+            data, _, key, load, seperator = match.groups()
+        else:
+            data, key, load, seperator = match.groups()
+        
+        # Process the parameters
+        url, token = step_1(data=data, key=key, load=load, seperator=seperator)
+        
+        # Prepare the POST request
+        post_url = url if url.startswith('http') else f"https://kwik.si{url}"
+        data = {"_token": token}
+        post_headers = {
+            'referer': link,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://kwik.si'
+        }
+        
+        # Make the POST request
+        resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=False)
+        
+        # Check for redirect in headers
+        if 'location' in resp.headers:
+            return resp.headers["location"]
+        
+        # If no redirect, follow redirects manually
+        resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=True)
+        
+        # Check if the final URL is different from the post URL
+        if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
+            return resp.url
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting direct link: {str(e)}")
+        raise
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 def get_latest_releases(page=1):
-    global scraper
+    """Get latest anime releases"""
+    global session
+    if session is None:
+        session = create_session()
+    
     releases_url = f"https://animepahe.ru/api?m=airing&page={page}"
-    headers = BASE_HEADERS.copy()
-    headers['user-agent'] = ua.random
+    
     try:
-        response = scraper.get(releases_url, headers=headers)
+        response = session.get(releases_url, headers=HEADERS)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Successfully retrieved latest releases, page {page}")
@@ -300,27 +468,42 @@ def get_latest_releases(page=1):
         return data
     except Exception as e:
         logger.error(f"Failed to get latest releases: {str(e)}")
-        if isinstance(e, requests.exceptions.HTTPError):
-            logger.error(f"Response content: {e.response.text[:500]}")
-        # Refresh scraper session on 403 error
-        if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 403:
-            logger.info("Refreshing scraper session due to 403 error")
-            scraper = create_scraper_session()
+        # Recreate session on error
+        if "403" in str(e) or "Forbidden" in str(e):
+            logger.info("Refreshing session due to 403 error")
+            session = create_session()
         raise
 
 def create_fallback_rss():
     """Create a minimal RSS feed if generation fails"""
     logger.info("Creating fallback RSS feed")
-    rss = ET.Element("rss", version="2.0")
-    channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "AnimePahe Latest Releases"
-    ET.SubElement(channel, "link").text = "https://animepahe.ru"
-    ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with 360p, 720p, and 1080p download links (temporarily unavailable)"
-    ET.SubElement(channel, "language").text = "en-us"
-    ET.SubElement(channel, "lastBuildDate").text = datetime.now(
-        pytz.timezone("Asia/Kolkata")
-    ).strftime("%a, %d %b %Y %H:%M:%S %z")
     try:
+        # Try to use cached releases
+        cached_releases = load_cached_releases()
+        
+        rss = ET.Element("rss", version="2.0")
+        channel = ET.SubElement(rss, "channel")
+        ET.SubElement(channel, "title").text = "AnimePahe Latest Releases"
+        ET.SubElement(channel, "link").text = "https://animepahe.ru"
+        ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe (cached data)"
+        ET.SubElement(channel, "language").text = "en-us"
+        ET.SubElement(channel, "lastBuildDate").text = datetime.now(
+            pytz.timezone("Asia/Kolkata")
+        ).strftime("%a, %d %b %Y %H:%M:%S %z")
+        
+        # Add cached releases as basic items
+        for anime in cached_releases[:MAX_ITEMS]:
+            item = ET.SubElement(channel, "item")
+            anime_title = anime.get('anime_title', 'Unknown Anime')
+            episode_number = anime.get('episode', 0)
+            ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+            ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
+            ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} (cached - download links not available)"
+            ET.SubElement(item, "pubDate").text = datetime.now(
+                pytz.timezone("Asia/Kolkata")
+            ).strftime("%a, %d %b %Y %H:%M:%S %z")
+            ET.SubElement(item, "guid").text = f"{anime_title}_Episode_{episode_number}"
+        
         tree = ET.ElementTree(rss)
         with open(RSS_FILE, 'wb') as f:
             tree.write(f, encoding='utf-8', xml_declaration=True)
@@ -330,43 +513,25 @@ def create_fallback_rss():
         logger.error(f"Error writing fallback RSS feed: {str(e)}")
         return False
 
-async def generate_rss_feed(new_releases=None):
-    """Generate or update RSS feed with the latest anime releases, maintaining 25 items"""
+async def generate_rss_feed():
+    """Generate RSS feed with the latest anime releases"""
     global previous_releases
-    logger.info("Checking for new anime releases to update RSS feed...")
+    logger.info("Generating RSS feed with latest anime releases...")
     
     try:
-        # Load existing RSS feed if it exists
-        items = []
-        if RSS_FILE.exists():
-            try:
-                tree = ET.parse(RSS_FILE)
-                root = tree.getroot()
-                channel = root.find("channel")
-                items = channel.findall("item")
-                logger.info(f"Loaded {len(items)} existing items from RSS feed")
-            except Exception as e:
-                logger.warning(f"Error reading existing RSS feed: {str(e)}. Starting fresh.")
-                items = []
+        # Get latest releases
+        latest_data = get_latest_releases(page=1)
+        if not latest_data or 'data' not in latest_data:
+            logger.error("Failed to get latest releases, using cache")
+            return create_fallback_rss()
         
-        # Get latest releases if not provided (for initial run or full refresh)
-        if new_releases is None:
-            try:
-                latest_data = get_latest_releases(page=1)
-                if not latest_data or 'data' not in latest_data:
-                    logger.error("Failed to get latest releases, using cache")
-                    new_releases = load_cached_releases()
-                else:
-                    new_releases = latest_data['data'][:MAX_ITEMS]
-            except Exception:
-                logger.error("Failed to get latest releases, using cache")
-                new_releases = load_cached_releases()
+        new_releases = latest_data['data'][:MAX_ITEMS]
         
         if not new_releases:
             logger.error("No new releases available, creating fallback RSS feed")
             return create_fallback_rss()
         
-        # Create or update RSS feed
+        # Create RSS feed
         rss = ET.Element("rss", version="2.0")
         channel = ET.SubElement(rss, "channel")
         
@@ -379,23 +544,46 @@ async def generate_rss_feed(new_releases=None):
             pytz.timezone("Asia/Kolkata")
         ).strftime("%a, %d %b %Y %H:%M:%S %z")
         
-        # Process new releases
-        new_items = []
+        # Process releases (limit to prevent rate limiting)
+        processed_count = 0
+        max_process = 10  # Limit processing to prevent 403 errors
+        
         for anime in new_releases:
+            if processed_count >= max_process:
+                # Add remaining releases as basic items without download links
+                anime_title = anime.get('anime_title', 'Unknown Anime')
+                episode_number = anime.get('episode', 0)
+                
+                item = ET.SubElement(channel, "item")
+                ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
+                ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                ET.SubElement(item, "pubDate").text = datetime.now(
+                    pytz.timezone("Asia/Kolkata")
+                ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                ET.SubElement(item, "guid").text = f"{anime_title}_Episode_{episode_number}"
+                continue
+            
             try:
                 anime_title = anime.get('anime_title', 'Unknown Anime')
                 episode_number = anime.get('episode', 0)
                 release_key = f"{anime_title}_Episode_{episode_number}"
                 
-                if release_key in previous_releases:
-                    continue  # Skip already processed episodes
-                
-                logger.info(f"Processing new release: {anime_title} Episode {episode_number}")
+                logger.info(f"Processing release: {anime_title} Episode {episode_number}")
                 
                 # Search for the anime
                 search_results = await search_anime(anime_title)
                 if not search_results:
                     logger.error(f"Anime not found: {anime_title}")
+                    # Add as basic item
+                    item = ET.SubElement(channel, "item")
+                    ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                    ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
+                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "pubDate").text = datetime.now(
+                        pytz.timezone("Asia/Kolkata")
+                    ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                    ET.SubElement(item, "guid").text = release_key
                     continue
                 
                 anime_info = search_results[0]
@@ -421,62 +609,92 @@ async def generate_rss_feed(new_releases=None):
                 
                 episode_session = target_episode['session']
                 
-                # Get download links
-                download_links = get_download_links(anime_session, episode_session)
-                if not download_links:
-                    logger.error(f"No download links found for {anime_title} Episode {episode_number}")
-                    continue
+                # Try to get download links (with timeout protection)
+                try:
+                    download_links = get_download_links(anime_session, episode_session)
+                    if not download_links:
+                        logger.error(f"No download links found for {anime_title} Episode {episode_number}")
+                        # Add as basic item
+                        item = ET.SubElement(channel, "item")
+                        ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                        ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime_session}"
+                        ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                        ET.SubElement(item, "pubDate").text = datetime.now(
+                            pytz.timezone("Asia/Kolkata")
+                        ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                        ET.SubElement(item, "guid").text = release_key
+                        continue
+                    
+                    # Find links for each quality
+                    quality_links = {}
+                    for quality in QUALITY_PREFERENCES:
+                        for link in download_links:
+                            if quality in link['text']:
+                                try:
+                                    kwik_link = extract_kwik_link(link['href'])
+                                    if kwik_link:
+                                        # Try to get direct link
+                                        direct_link = get_dl_link(kwik_link)
+                                        quality_links[quality] = direct_link or kwik_link
+                                        break
+                                except Exception as e:
+                                    logger.error(f"Error getting {quality} link: {str(e)}")
+                                    # Use kwik link as fallback
+                                    kwik_link = extract_kwik_link(link['href'])
+                                    if kwik_link:
+                                        quality_links[quality] = kwik_link
+                                        break
+                    
+                    # Create RSS item
+                    item = ET.SubElement(channel, "item")
+                    ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                    
+                    # Use the best available quality as primary link
+                    primary_link = quality_links.get("1080p") or quality_links.get("720p") or quality_links.get("360p")
+                    ET.SubElement(item, "link").text = primary_link or f"https://animepahe.ru/anime/{anime_session}"
+                    
+                    # Create description with all quality links
+                    description = f"Episode {episode_number} of {anime_title}\n\n"
+                    if quality_links:
+                        description += "Download Links:\n"
+                        for quality, link in quality_links.items():
+                            description += f"{quality}: {link}\n"
+                    else:
+                        description += "Visit AnimePahe for download links"
+                    
+                    ET.SubElement(item, "description").text = description
+                    ET.SubElement(item, "pubDate").text = datetime.now(
+                        pytz.timezone("Asia/Kolkata")
+                    ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                    ET.SubElement(item, "author").text = "AnimePahe"
+                    ET.SubElement(item, "guid").text = primary_link or release_key
+                    
+                    processed_count += 1
+                    logger.info(f"Added {anime_title} Episode {episode_number} with {len(quality_links)} quality links")
+                    
+                    # Add delay between processing to avoid rate limits
+                    await asyncio.sleep(random.uniform(2, 4))
                 
-                # Find links for each quality
-                quality_links = {}
-                for quality in QUALITY_PREFERENCES:
-                    for link in download_links:
-                        if quality in link['text']:
-                            kwik_link = extract_kwik_link(link['href'])
-                            if kwik_link:
-                                quality_links[quality] = kwik_link
+                except Exception as e:
+                    logger.error(f"Error processing download links for {anime_title} Episode {episode_number}: {str(e)}")
+                    # Add as basic item
+                    item = ET.SubElement(channel, "item")
+                    ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                    ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
+                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "pubDate").text = datetime.now(
+                        pytz.timezone("Asia/Kolkata")
+                    ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                    ET.SubElement(item, "guid").text = release_key
                 
-                if not quality_links:
-                    logger.error(f"No quality links found for {anime_title} Episode {episode_number}")
-                    continue
-                
-                # Create RSS item
-                item = ET.Element("item")
-                ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
-                primary_link = quality_links.get("1080p") or quality_links.get("720p") or quality_links.get("360p")
-                ET.SubElement(item, "link").text = primary_link
-                description = f"Episode {episode_number} of {anime_title}\n\n"
-                for quality, link in quality_links.items():
-                    description += f"{quality}: {link}\n"
-                ET.SubElement(item, "description").text = description
-                ET.SubElement(item, "pubDate").text = datetime.now(
-                    pytz.timezone("Asia/Kolkata")
-                ).strftime("%a, %d %b %Y %H:%M:%S %z")
-                ET.SubElement(item, "author").text = "Blakite_Ravii"
-                ET.SubElement(item, "guid").text = primary_link
-                
-                new_items.append((item, release_key))
-                logger.info(f"Added {anime_title} Episode {episode_number} with {len(quality_links)} quality links")
-            
             except Exception as e:
                 logger.error(f"Error processing {anime_title} Episode {episode_number}: {str(e)}")
                 continue
         
-        # Combine new and existing items (newest at top)
-        all_items = new_items + [(item, f"{item.find('title').text}") for item in items]
-        all_items = all_items[:MAX_ITEMS]  # Keep only the latest 25 items
-        
-        # Add items to channel
-        for item, _ in all_items:
-            channel.append(item)
-        
-        # Update previous_releases
-        previous_releases = set(key for _, key in all_items)
-        
         # Write RSS feed to file
         try:
+            tree = ET.ElementTree(rss)
             with open(RSS_FILE, 'wb') as f:
-                tree = ET.ElementTree(rss)
                 tree.write(f, encoding='utf-8', xml_declaration=True)
             logger.info(f"RSS feed written to {RSS_FILE}")
             return True
@@ -489,37 +707,20 @@ async def generate_rss_feed(new_releases=None):
         return create_fallback_rss()
 
 async def update_rss_loop():
-    """Background task to update RSS feed every 10-30 seconds with new releases"""
-    global previous_releases
+    """Background task to update RSS feed periodically"""
     while True:
         try:
-            # Get latest releases
-            latest_data = get_latest_releases(page=1)
-            if not latest_data or 'data' not in latest_data:
-                logger.error("Failed to get latest releases")
-                create_fallback_rss()
-                await asyncio.sleep(random.uniform(UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX))
-                continue
-            
-            # Check for new releases
-            new_releases = []
-            for anime in latest_data['data'][:MAX_ITEMS]:
-                release_key = f"{anime.get('anime_title', 'Unknown Anime')}_Episode_{anime.get('episode', 0)}"
-                if release_key not in previous_releases:
-                    new_releases.append(anime)
-            
-            if new_releases:
-                logger.info(f"Found {len(new_releases)} new releases")
-                await generate_rss_feed(new_releases=new_releases)
-            else:
-                logger.info("No new releases found")
-        
+            logger.info("Starting RSS feed update...")
+            await generate_rss_feed()
+            logger.info("RSS feed update completed")
         except Exception as e:
             logger.error(f"Error in RSS update loop: {str(e)}")
             create_fallback_rss()
         
-        # Random delay between 10-30 seconds
-        await asyncio.sleep(random.uniform(UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX))
+        # Wait before next update
+        sleep_time = random.uniform(UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX)
+        logger.info(f"Next update in {sleep_time:.1f} seconds")
+        await asyncio.sleep(sleep_time)
 
 @app.route('/')
 def serve_rss():
@@ -541,11 +742,28 @@ def serve_rss():
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint to verify service status"""
+    """Health check endpoint"""
     if RSS_FILE.exists():
         return Response("Service is running and RSS feed is available", status=200)
     else:
         return Response("Service is running but RSS feed is not available", status=503)
+
+@app.route('/status')
+def status():
+    """Status endpoint with details"""
+    status_info = {
+        'rss_file_exists': RSS_FILE.exists(),
+        'cache_file_exists': CACHE_FILE.exists(),
+        'last_update': datetime.now().isoformat(),
+        'max_items': MAX_ITEMS,
+        'update_interval': f"{UPDATE_INTERVAL_MIN}-{UPDATE_INTERVAL_MAX}s"
+    }
+    
+    if RSS_FILE.exists():
+        status_info['rss_file_size'] = RSS_FILE.stat().st_size
+        status_info['rss_file_modified'] = datetime.fromtimestamp(RSS_FILE.stat().st_mtime).isoformat()
+    
+    return status_info
 
 def start_flask():
     """Start Flask server in a separate thread"""
@@ -554,10 +772,14 @@ def start_flask():
     app.run(host='0.0.0.0', port=port)
 
 def main():
-    """Synchronous main function to ensure initial RSS feed generation"""
-    logger.info("Starting RSS feed generator service...")
+    """Main function"""
+    logger.info("Starting AnimePahe RSS Feed Generator...")
     
-    # Generate initial RSS feed synchronously
+    # Initialize session
+    global session
+    session = create_session()
+    
+    # Generate initial RSS feed
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -575,7 +797,12 @@ def main():
     # Start RSS update loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(update_rss_loop())
+    try:
+        loop.run_until_complete(update_rss_loop())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Error in main loop: {str(e)}")
 
 if __name__ == '__main__':
     main()
