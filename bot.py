@@ -74,6 +74,30 @@ previous_releases = set()
 
 # Global session with proper cookie handling
 session = None
+scraper = None
+
+def create_scraper():
+    """Create a cloudscraper session with proper configuration"""
+    global scraper
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+        interpreter='nodejs',
+        ecdh_curve='secp384r1'
+    )
+    
+    # Set headers
+    scraper.headers.update(HEADERS)
+    
+    # Initialize session by visiting the main page
+    try:
+        response = scraper.get("https://animepahe.ru/")
+        response.raise_for_status()
+        logger.info("Cloudscraper session initialized successfully")
+        time.sleep(random.uniform(2, 4))  # Respectful delay
+    except Exception as e:
+        logger.error(f"Failed to initialize cloudscraper session: {str(e)}")
+    
+    return scraper
 
 def create_session():
     """Create a requests session with proper headers and cookies"""
@@ -197,9 +221,9 @@ def step_1(data, key, load, seperator):
 )
 def get_download_links(anime_session, episode_session):
     """Get download links for an episode"""
-    global session
-    if session is None:
-        session = create_session()
+    global scraper
+    if scraper is None:
+        scraper = create_scraper()
     
     if '-' in episode_session:
         episode_url = f"https://animepahe.ru/play/{episode_session}"
@@ -216,10 +240,10 @@ def get_download_links(anime_session, episode_session):
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache'
         }
-        session.headers.update(local_headers)
+        scraper.headers.update(local_headers)
         
         logger.info(f"Fetching episode page: {episode_url}")
-        response = session.get(episode_url)
+        response = scraper.get(episode_url)
         response.raise_for_status()
         
         for parser in ['lxml', 'html.parser', 'html5lib']:
@@ -277,8 +301,8 @@ def get_download_links(anime_session, episode_session):
         
     except Exception as e:
         logger.error(f"Error getting download links: {str(e)}")
-        # Recreate session on error
-        session = create_session()
+        # Recreate scraper on error
+        scraper = create_scraper()
         raise
 
 @retry(
@@ -288,9 +312,9 @@ def get_download_links(anime_session, episode_session):
 )
 def extract_kwik_link(url):
     """Extract kwik.si link from download page"""
-    global session
-    if session is None:
-        session = create_session()
+    global scraper
+    if scraper is None:
+        scraper = create_scraper()
     
     try:
         # Add random delay
@@ -311,7 +335,7 @@ def extract_kwik_link(url):
             'Referer': 'https://animepahe.ru/'
         }
         
-        response = session.get(url, headers=headers)
+        response = scraper.get(url, headers=headers)
         response.raise_for_status()
         
         logger.info(f"Got response from {url}, status code: {response.status_code}")
@@ -357,19 +381,13 @@ def extract_kwik_link(url):
 )
 def get_dl_link(link):
     """Get direct download link from kwik.si"""
-    global session
-    if session is None:
-        session = create_session()
+    global scraper
+    if scraper is None:
+        scraper = create_scraper()
     
     try:
         # Add random delay to avoid rate limiting
         time.sleep(random.uniform(2, 4))
-        
-        # Use cloudscraper for better compatibility
-        scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-            interpreter='nodejs'
-        )
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -453,14 +471,14 @@ def get_dl_link(link):
 )
 def get_latest_releases(page=1):
     """Get latest anime releases"""
-    global session
-    if session is None:
-        session = create_session()
+    global scraper
+    if scraper is None:
+        scraper = create_scraper()
     
     releases_url = f"https://animepahe.ru/api?m=airing&page={page}"
     
     try:
-        response = session.get(releases_url, headers=HEADERS)
+        response = scraper.get(releases_url, headers=HEADERS)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Successfully retrieved latest releases, page {page}")
@@ -468,10 +486,10 @@ def get_latest_releases(page=1):
         return data
     except Exception as e:
         logger.error(f"Failed to get latest releases: {str(e)}")
-        # Recreate session on error
+        # Recreate scraper on error
         if "403" in str(e) or "Forbidden" in str(e):
-            logger.info("Refreshing session due to 403 error")
-            session = create_session()
+            logger.info("Refreshing scraper due to 403 error")
+            scraper = create_scraper()
         raise
 
 def create_fallback_rss():
@@ -776,7 +794,8 @@ def main():
     logger.info("Starting AnimePahe RSS Feed Generator...")
     
     # Initialize session
-    global session
+    global scraper, session
+    scraper = create_scraper()
     session = create_session()
     
     # Generate initial RSS feed
