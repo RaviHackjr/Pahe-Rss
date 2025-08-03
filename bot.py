@@ -81,8 +81,7 @@ def create_scraper():
     global scraper
     scraper = cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-        interpreter='nodejs',
-        ecdh_curve='secp384r1'
+        interpreter='nodejs'
     )
     
     # Set headers
