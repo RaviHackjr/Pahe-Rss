@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -21,8 +22,7 @@ from urllib.parse import quote
 from tenacity import retry, stop_after_attempt, wait_exponential
 import xml.etree.ElementTree as ET
 import cloudscraper
-from flask import Flask, send_file
-import threading
+from flask import Flask, send_file, Response
 
 # Configure logging
 logging.basicConfig(
@@ -69,7 +69,12 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 # Store previous releases to detect new episodes
 previous_releases = set()
 
-# API functions
+# Create cloudscraper instance
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+    interpreter='nodejs'
+)
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -164,10 +169,6 @@ def get_download_links(anime_session, episode_session):
     reraise=True
 )
 def extract_kwik_link(url):
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-        interpreter='nodejs'
-    )
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -216,11 +217,42 @@ def extract_kwik_link(url):
     logger.error(f"No kwik link found for {url}")
     return None
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    reraise=True
+)
 def get_latest_releases(page=1):
     releases_url = f"https://animepahe.ru/api?m=airing&page={page}"
-    response = requests.get(releases_url, headers=HEADERS)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = scraper.get(releases_url, headers=HEADERS)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to get latest releases: {str(e)}")
+        raise
+
+def create_fallback_rss():
+    """Create a minimal RSS feed if generation fails"""
+    logger.info("Creating fallback RSS feed")
+    rss = ET.Element("rss", version="2.0")
+    channel = ET.SubElement(rss, "channel")
+    ET.SubElement(channel, "title").text = "AnimePahe Latest Releases"
+    ET.SubElement(channel, "link").text = "https://animepahe.ru"
+    ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with 360p, 720p, and 1080p download links (temporarily unavailable)"
+    ET.SubElement(channel, "language").text = "en-us"
+    ET.SubElement(channel, "lastBuildDate").text = datetime.now(
+        pytz.timezone("Asia/Kolkata")
+    ).strftime("%a, %d %b %Y %H:%M:%S %z")
+    try:
+        tree = ET.ElementTree(rss)
+        with open(RSS_FILE, 'wb') as f:
+            tree.write(f, encoding='utf-8', xml_declaration=True)
+        logger.info(f"Fallback RSS feed written to {RSS_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing fallback RSS feed: {str(e)}")
+        return False
 
 async def generate_rss_feed(new_releases=None):
     """Generate or update RSS feed with the latest anime releases, maintaining 25 items"""
@@ -236,6 +268,7 @@ async def generate_rss_feed(new_releases=None):
                 root = tree.getroot()
                 channel = root.find("channel")
                 items = channel.findall("item")
+                logger.info(f"Loaded {len(items)} existing items from RSS feed")
             except Exception as e:
                 logger.warning(f"Error reading existing RSS feed: {str(e)}. Starting fresh.")
                 items = []
@@ -244,8 +277,8 @@ async def generate_rss_feed(new_releases=None):
         if new_releases is None:
             latest_data = get_latest_releases(page=1)
             if not latest_data or 'data' not in latest_data:
-                logger.error("Failed to get latest releases")
-                return False
+                logger.error("Failed to get latest releases, creating fallback RSS feed")
+                return create_fallback_rss()
             new_releases = latest_data['data'][:MAX_ITEMS]
         
         # Create or update RSS feed
@@ -356,19 +389,19 @@ async def generate_rss_feed(new_releases=None):
         previous_releases = set(key for _, key in all_items)
         
         # Write RSS feed to file
-        tree = ET.ElementTree(rss)
         try:
             with open(RSS_FILE, 'wb') as f:
+                tree = ET.ElementTree(rss)
                 tree.write(f, encoding='utf-8', xml_declaration=True)
             logger.info(f"RSS feed written to {RSS_FILE}")
             return True
         except Exception as e:
             logger.error(f"Error writing RSS feed to file: {str(e)}")
-            return False
+            return create_fallback_rss()
     
     except Exception as e:
         logger.error(f"Error generating RSS feed: {str(e)}")
-        return False
+        return create_fallback_rss()
 
 async def update_rss_loop():
     """Background task to update RSS feed every 10-30 seconds with new releases"""
@@ -379,6 +412,7 @@ async def update_rss_loop():
             latest_data = get_latest_releases(page=1)
             if not latest_data or 'data' not in latest_data:
                 logger.error("Failed to get latest releases")
+                create_fallback_rss()
                 await asyncio.sleep(random.uniform(UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX))
                 continue
             
@@ -397,6 +431,7 @@ async def update_rss_loop():
         
         except Exception as e:
             logger.error(f"Error in RSS update loop: {str(e)}")
+            create_fallback_rss()
         
         # Random delay between 10-30 seconds
         await asyncio.sleep(random.uniform(UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX))
@@ -406,29 +441,56 @@ def serve_rss():
     """Serve the RSS feed file"""
     try:
         if RSS_FILE.exists():
+            logger.info(f"Serving RSS feed from {RSS_FILE}")
             return send_file(RSS_FILE, mimetype='application/rss+xml')
         else:
+            logger.error(f"RSS feed file not found at {RSS_FILE}")
+            create_fallback_rss()
+            if RSS_FILE.exists():
+                logger.info(f"Serving fallback RSS feed from {RSS_FILE}")
+                return send_file(RSS_FILE, mimetype='application/rss+xml')
             return "RSS feed not found", 404
     except Exception as e:
         logger.error(f"Error serving RSS feed: {str(e)}")
         return "Error serving RSS feed", 500
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint to verify service status"""
+    if RSS_FILE.exists():
+        return Response("Service is running and RSS feed is available", status=200)
+    else:
+        return Response("Service is running but RSS feed is not available", status=503)
+
 def start_flask():
     """Start Flask server in a separate thread"""
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+    port = int(os.environ.get('PORT', 8000))
+    logger.info(f"Starting Flask server on port {port}")
+    app.run(host='0.0.0.0', port=port)
 
-async def main():
+def main():
+    """Synchronous main function to ensure initial RSS feed generation"""
     logger.info("Starting RSS feed generator service...")
     
-    # Generate initial RSS feed
-    await generate_rss_feed()
+    # Generate initial RSS feed synchronously
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(generate_rss_feed())
+    except Exception as e:
+        logger.error(f"Initial RSS feed generation failed: {str(e)}")
+        create_fallback_rss()
+    finally:
+        loop.close()
     
     # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
     
     # Start RSS update loop
-    await update_rss_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(update_rss_loop())
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
