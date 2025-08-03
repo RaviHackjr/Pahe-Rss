@@ -4,3 +4,4 @@ beautifulsoup4==4.12.3
 cloudscraper==1.2.71
 tenacity==8.5.0
 flask==3.0.3
+pytz==2024.1
