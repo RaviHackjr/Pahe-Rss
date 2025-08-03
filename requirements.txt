@@ -5,3 +5,4 @@ cloudscraper==1.2.71
 tenacity==8.5.0
 flask==3.0.3
 pytz==2024.1
+lxml==5.3.0
