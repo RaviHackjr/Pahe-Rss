@@ -246,7 +246,8 @@ def get_download_links(anime_session, episode_session):
         response = scraper.get(episode_url)
         response.raise_for_status()
         
-        for parser in ['lxml', 'html.parser', 'html5lib']:
+        # Try html5lib first (more reliable for complex pages)
+        for parser in ['html5lib', 'html.parser']:
             try:
                 soup = BeautifulSoup(response.content, parser)
                 break
@@ -340,7 +341,8 @@ def extract_kwik_link(url):
         
         logger.info(f"Got response from {url}, status code: {response.status_code}")
         
-        for parser in ['lxml', 'html.parser', 'html5lib']:
+        # Try html5lib first (more reliable for complex pages)
+        for parser in ['html5lib', 'html.parser']:
             try:
                 soup = BeautifulSoup(response.text, parser)
                 break
