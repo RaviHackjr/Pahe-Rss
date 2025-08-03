@@ -6,3 +6,4 @@ lxml==4.9.3
 pytz==2023.3
 requests==2.31.0
 tenacity==8.2.3
+html5lib==1.1
