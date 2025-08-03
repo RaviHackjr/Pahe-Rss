@@ -11,8 +11,7 @@ import re
 import time
 import random
 import asyncio
-import aiohttp
-import requests
+import json
 import threading
 from datetime import datetime, timezone
 import pytz
@@ -23,6 +22,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import xml.etree.ElementTree as ET
 import cloudscraper
 from flask import Flask, send_file, Response
+from fake_useragent import UserAgent
 
 # Configure logging
 logging.basicConfig(
@@ -38,8 +38,11 @@ logger = logging.getLogger(__name__)
 # Flask app setup
 app = Flask(__name__)
 
-# Headers for requests
-HEADERS = {
+# Initialize UserAgent for random browser headers
+ua = UserAgent()
+
+# Base headers
+BASE_HEADERS = {
     'authority': 'animepahe.ru',
     'accept': 'application/json, text/javascript, */*; q=0.01',
     'accept-language': 'en-US,en;q=0.9',
@@ -53,12 +56,12 @@ HEADERS = {
     'sec-fetch-site': 'same-origin',
     'x-requested-with': 'XMLHttpRequest',
     'referer': 'https://animepahe.ru/',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
 }
 
 # Configuration
 BASE_DIR = Path(__file__).parent.resolve()
 RSS_FILE = BASE_DIR / "animepahe_feed.xml"
+CACHE_FILE = BASE_DIR / "animepahe_cache.json"
 QUALITY_PREFERENCES = ["360p", "720p", "1080p"]
 UPDATE_INTERVAL_MIN = 10  # seconds
 UPDATE_INTERVAL_MAX = 30  # seconds
@@ -76,54 +79,87 @@ def create_scraper_session():
         browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
         interpreter='nodejs'
     )
-    # Initialize session with cookies from homepage
+    headers = BASE_HEADERS.copy()
+    headers['user-agent'] = ua.random
     try:
-        response = scraper.get("https://animepahe.ru/", headers=HEADERS)
-        response.raise_for_status()
-        logger.info("Initialized scraper session with cookies from animepahe.ru")
+        # Visit multiple pages to simulate a browser session
+        for url in ["https://animepahe.ru/", "https://animepahe.ru/anime"]:
+            response = scraper.get(url, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Initialized scraper session with cookies from {url}")
+            time.sleep(random.uniform(1, 3))  # Simulate human-like delay
     except Exception as e:
-        logger.error(f"Failed to initialize scraper session: {str(e)}")
+        logger.error(f"Failed to initialize scraper session for {url}: {str(e)}")
     return scraper
 
 scraper = create_scraper_session()
 
+def load_cached_releases():
+    """Load cached releases from disk if available"""
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                data = json.load(f)
+                logger.info("Loaded cached releases from disk")
+                return data.get('releases', [])
+        except Exception as e:
+            logger.error(f"Error loading cache: {str(e)}")
+    return []
+
+def save_cached_releases(releases):
+    """Save releases to disk for fallback"""
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump({'releases': releases}, f)
+        logger.info("Saved releases to cache")
+    except Exception as e:
+        logger.error(f"Error saving cache: {str(e)}")
+
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=3, min=5, max=20),
     reraise=True
 )
 async def search_anime(query: str) -> list:
     search_url = f"https://animepahe.ru/api?m=search&q={quote(query)}"
+    headers = BASE_HEADERS.copy()
+    headers['user-agent'] = ua.random
     try:
-        response = scraper.get(search_url, headers=HEADERS)
+        response = scraper.get(search_url, headers=headers)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Search successful for query: {query}")
         return data.get('data', [])
     except Exception as e:
         logger.error(f"Search failed for query {query}: {str(e)}")
+        if isinstance(e, requests.exceptions.HTTPError):
+            logger.error(f"Response content: {e.response.text[:500]}")
         raise
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=3, min=5, max=20),
     reraise=True
 )
 async def get_episode_list(session_id: str, page: int = 1) -> dict:
     episodes_url = f"https://animepahe.ru/api?m=release&id={session_id}&sort=episode_asc&page={page}"
+    headers = BASE_HEADERS.copy()
+    headers['user-agent'] = ua.random
     try:
-        response = scraper.get(episodes_url, headers=HEADERS)
+        response = scraper.get(episodes_url, headers=headers)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Retrieved episode list for session {session_id}, page {page}")
         return data
     except Exception as e:
         logger.error(f"Failed to get episode list for session {session_id}: {str(e)}")
+        if isinstance(e, requests.exceptions.HTTPError):
+            logger.error(f"Response content: {e.response.text[:500]}")
         raise
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=3, min=5, max=20),
     reraise=True
 )
 def get_download_links(anime_session, episode_session):
@@ -143,7 +179,7 @@ def get_download_links(anime_session, episode_session):
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': HEADERS['user-agent'],
+        'User-Agent': ua.random,
         'Referer': 'https://animepahe.ru/'
     }
     logger.info(f"Fetching episode page: {episode_url}")
@@ -189,13 +225,13 @@ def get_download_links(anime_session, episode_session):
     return None
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=3, min=5, max=20),
     reraise=True
 )
 def extract_kwik_link(url):
     local_headers = {
-        'User-Agent': HEADERS['user-agent'],
+        'User-Agent': ua.random,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -246,20 +282,30 @@ def extract_kwik_link(url):
     return None
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=3, min=5, max=20),
     reraise=True
 )
 def get_latest_releases(page=1):
+    global scraper
     releases_url = f"https://animepahe.ru/api?m=airing&page={page}"
+    headers = BASE_HEADERS.copy()
+    headers['user-agent'] = ua.random
     try:
-        response = scraper.get(releases_url, headers=HEADERS)
+        response = scraper.get(releases_url, headers=headers)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Successfully retrieved latest releases, page {page}")
+        save_cached_releases(data.get('data', []))
         return data
     except Exception as e:
         logger.error(f"Failed to get latest releases: {str(e)}")
+        if isinstance(e, requests.exceptions.HTTPError):
+            logger.error(f"Response content: {e.response.text[:500]}")
+        # Refresh scraper session on 403 error
+        if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 403:
+            logger.info("Refreshing scraper session due to 403 error")
+            scraper = create_scraper_session()
         raise
 
 def create_fallback_rss():
@@ -305,11 +351,20 @@ async def generate_rss_feed(new_releases=None):
         
         # Get latest releases if not provided (for initial run or full refresh)
         if new_releases is None:
-            latest_data = get_latest_releases(page=1)
-            if not latest_data or 'data' not in latest_data:
-                logger.error("Failed to get latest releases, creating fallback RSS feed")
-                return create_fallback_rss()
-            new_releases = latest_data['data'][:MAX_ITEMS]
+            try:
+                latest_data = get_latest_releases(page=1)
+                if not latest_data or 'data' not in latest_data:
+                    logger.error("Failed to get latest releases, using cache")
+                    new_releases = load_cached_releases()
+                else:
+                    new_releases = latest_data['data'][:MAX_ITEMS]
+            except Exception:
+                logger.error("Failed to get latest releases, using cache")
+                new_releases = load_cached_releases()
+        
+        if not new_releases:
+            logger.error("No new releases available, creating fallback RSS feed")
+            return create_fallback_rss()
         
         # Create or update RSS feed
         rss = ET.Element("rss", version="2.0")
