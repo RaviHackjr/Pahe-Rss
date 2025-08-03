@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -14,6 +13,7 @@ import random
 import asyncio
 import aiohttp
 import requests
+import threading
 from datetime import datetime, timezone
 import pytz
 from pathlib import Path
@@ -43,8 +43,9 @@ HEADERS = {
     'authority': 'animepahe.ru',
     'accept': 'application/json, text/javascript, */*; q=0.01',
     'accept-language': 'en-US,en;q=0.9',
+    'accept-encoding': 'gzip, deflate, br',
     'dnt': '1',
-    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="124", "Chromium";v="124"',
+    'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="129", "Chromium";v="129"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
@@ -52,7 +53,7 @@ HEADERS = {
     'sec-fetch-site': 'same-origin',
     'x-requested-with': 'XMLHttpRequest',
     'referer': 'https://animepahe.ru/',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
 }
 
 # Configuration
@@ -69,36 +70,56 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 # Store previous releases to detect new episodes
 previous_releases = set()
 
-# Create cloudscraper instance
-scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-    interpreter='nodejs'
-)
+# Create cloudscraper session with cookies
+def create_scraper_session():
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+        interpreter='nodejs'
+    )
+    # Initialize session with cookies from homepage
+    try:
+        response = scraper.get("https://animepahe.ru/", headers=HEADERS)
+        response.raise_for_status()
+        logger.info("Initialized scraper session with cookies from animepahe.ru")
+    except Exception as e:
+        logger.error(f"Failed to initialize scraper session: {str(e)}")
+    return scraper
+
+scraper = create_scraper_session()
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 async def search_anime(query: str) -> list:
     search_url = f"https://animepahe.ru/api?m=search&q={quote(query)}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(search_url, headers=HEADERS) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data.get('data', [])
+    try:
+        response = scraper.get(search_url, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Search successful for query: {query}")
+        return data.get('data', [])
+    except Exception as e:
+        logger.error(f"Search failed for query {query}: {str(e)}")
+        raise
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 async def get_episode_list(session_id: str, page: int = 1) -> dict:
     episodes_url = f"https://animepahe.ru/api?m=release&id={session_id}&sort=episode_asc&page={page}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(episodes_url, headers=HEADERS) as response:
-            response.raise_for_status()
-            return await response.json()
+    try:
+        response = scraper.get(episodes_url, headers=HEADERS)
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Retrieved episode list for session {session_id}, page {page}")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to get episode list for session {session_id}: {str(e)}")
+        raise
 
 @retry(
     stop=stop_after_attempt(3),
@@ -111,26 +132,30 @@ def get_download_links(anime_session, episode_session):
     else:
         episode_url = f"https://animepahe.ru/play/{anime_session}/{episode_session}"
     
-    session = requests.Session()
-    session.headers.update(HEADERS)
     time.sleep(random.uniform(2, 5))
     local_headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
         'Upgrade-Insecure-Requests': '1',
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
+        'Pragma': 'no-cache',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'User-Agent': HEADERS['user-agent'],
+        'Referer': 'https://animepahe.ru/'
     }
-    session.headers.update(local_headers)
-    session.get("https://animepahe.ru/")
     logger.info(f"Fetching episode page: {episode_url}")
-    response = session.get(episode_url)
+    response = scraper.get(episode_url, headers=local_headers)
     response.raise_for_status()
     
     for parser in ['lxml', 'html.parser', 'html5lib']:
         try:
             soup = BeautifulSoup(response.content, parser)
             break
-        except:
+        except Exception as e:
+            logger.warning(f"Parser {parser} failed: {str(e)}")
             continue
     
     links = []
@@ -165,12 +190,12 @@ def get_download_links(anime_session, episode_session):
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 def extract_kwik_link(url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    local_headers = {
+        'User-Agent': HEADERS['user-agent'],
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -184,8 +209,7 @@ def extract_kwik_link(url):
         'Referer': 'https://animepahe.ru/'
     }
     
-    scraper.get("https://animepahe.ru/", headers=headers)
-    response = scraper.get(url, headers=headers)
+    response = scraper.get(url, headers=local_headers)
     response.raise_for_status()
     
     for parser in ['lxml', 'html.parser', 'html5lib']:
@@ -196,30 +220,34 @@ def extract_kwik_link(url):
             logger.warning(f"Parser {parser} failed: {str(e)}")
             continue
     
+    # Broader search for kwik.si links
+    page_text = str(soup)
+    matches = re.findall(r'https://kwik\.si/f/[\w\d-]+', page_text)
+    if matches:
+        logger.info(f"Found kwik link: {matches[0]}")
+        return matches[0]
+    
     for script in soup.find_all('script'):
         if script.string:
             match = re.search(r'https://kwik\.si/f/[\w\d-]+', script.string)
             if match:
+                logger.info(f"Found kwik link in script: {match.group(0)}")
                 return match.group(0)
     
-    download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"]')
+    download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"], a[data-src*="kwik.si"]')
     for element in download_elements:
-        href = element.get('href') or element.get('onclick', '')
+        href = element.get('href') or element.get('onclick') or element.get('data-src', '')
         match = re.search(r'https://kwik\.si/f/[\w\d-]+', href)
         if match:
+            logger.info(f"Found kwik link in element: {match.group(0)}")
             return match.group(0)
-    
-    page_text = str(soup)
-    matches = re.findall(r'https://kwik\.si/f/[\w\d-]+', page_text)
-    if matches:
-        return matches[0]
     
     logger.error(f"No kwik link found for {url}")
     return None
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
 def get_latest_releases(page=1):
@@ -227,7 +255,9 @@ def get_latest_releases(page=1):
     try:
         response = scraper.get(releases_url, headers=HEADERS)
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        logger.info(f"Successfully retrieved latest releases, page {page}")
+        return data
     except Exception as e:
         logger.error(f"Failed to get latest releases: {str(e)}")
         raise
