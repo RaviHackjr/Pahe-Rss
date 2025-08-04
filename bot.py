@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import quote
 from tenacity import retry, stop_after_attempt, wait_exponential
 import xml.etree.ElementTree as ET
+from xml.dom import minidom
 import cloudscraper
 from flask import Flask, send_file, Response
 
@@ -180,6 +181,29 @@ async def get_episode_list(session_id: str, page: int = 1) -> dict:
             logger.error(f"Failed to get episode list for session {session_id}: {str(e)}")
             raise
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
+    reraise=True
+)
+async def get_episode_by_number(anime_session, episode_number, max_pages=5):
+    """Get a specific episode by its number, searching through multiple pages if needed"""
+    for page in range(1, max_pages + 1):
+        episode_data = await get_episode_list(anime_session, page)
+        if not episode_data or 'data' not in episode_data:
+            return None
+        
+        episodes = episode_data['data']
+        for ep in episodes:
+            if int(ep['episode']) == episode_number:
+                return ep
+        
+        # If we've reached the last page, break
+        if page >= episode_data.get('last_page', 1):
+            break
+    
+    return None
+
 def step_2(s, seperator, base=10):
     """Helper function for kwik link extraction"""
     mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
@@ -316,6 +340,12 @@ def extract_kwik_link(url):
     if scraper is None:
         scraper = create_scraper()
     
+    # Check if the URL is already a kwik link
+    kwik_pattern = r'https://kwik\.si/f/[\w\d-]+'
+    if re.match(kwik_pattern, url):
+        logger.info(f"URL is already a kwik link: {url}")
+        return url
+    
     try:
         # Add random delay
         time.sleep(random.uniform(2, 4))
@@ -335,10 +365,16 @@ def extract_kwik_link(url):
             'Referer': 'https://animepahe.ru/'
         }
         
-        response = scraper.get(url, headers=headers)
+        response = scraper.get(url, headers=headers, allow_redirects=True)
         response.raise_for_status()
         
         logger.info(f"Got response from {url}, status code: {response.status_code}")
+        
+        # Check if the final URL is a kwik link
+        final_url = response.url
+        if re.match(kwik_pattern, final_url):
+            logger.info(f"Final URL is a kwik link: {final_url}")
+            return final_url
         
         # Try html5lib first (more reliable for complex pages)
         for parser in ['html5lib', 'html.parser']:
@@ -352,24 +388,29 @@ def extract_kwik_link(url):
         # Look for the kwik link in script tags
         for script in soup.find_all('script'):
             if script.string:
-                match = re.search(r'https://kwik\.si/f/[\w\d-]+', script.string)
+                match = re.search(kwik_pattern, script.string)
                 if match:
+                    logger.info(f"Found kwik link in script: {match.group(0)}")
                     return match.group(0)
         
         # Look for download elements
         download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"]')
         for element in download_elements:
             href = element.get('href') or element.get('onclick', '')
-            match = re.search(r'https://kwik\.si/f/[\w\d-]+', href)
+            match = re.search(kwik_pattern, href)
             if match:
+                logger.info(f"Found kwik link in element: {match.group(0)}")
                 return match.group(0)
         
         # Look in the whole page text
         page_text = str(soup)
-        matches = re.findall(r'https://kwik\.si/f/[\w\d-]+', page_text)
+        matches = re.findall(kwik_pattern, page_text)
         if matches:
+            logger.info(f"Found kwik link in page text: {matches[0]}")
             return matches[0]
         
+        # If we get here, we didn't find a kwik link
+        logger.warning(f"No kwik link found in response from {url}. Final URL: {final_url}")
         return None
     except Exception as e:
         logger.error(f"Error extracting kwik link: {str(e)}")
@@ -450,6 +491,7 @@ def get_dl_link(link):
         
         # Check for redirect in headers
         if 'location' in resp.headers:
+            logger.info(f"Found redirect to: {resp.headers['location']}")
             return resp.headers["location"]
         
         # If no redirect, follow redirects manually
@@ -457,6 +499,7 @@ def get_dl_link(link):
         
         # Check if the final URL is different from the post URL
         if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
+            logger.info(f"Final URL after POST: {resp.url}")
             return resp.url
         
         return None
@@ -523,9 +566,17 @@ def create_fallback_rss():
             ).strftime("%a, %d %b %Y %H:%M:%S %z")
             ET.SubElement(item, "guid").text = f"{anime_title}_Episode_{episode_number}"
         
-        tree = ET.ElementTree(rss)
+        # Pretty print the XML
+        rough_string = ET.tostring(rss, 'utf-8')
+        reparsed = minidom.parseString(rough_string)
+        pretty_xml = reparsed.toprettyxml(indent="  ")
+        
+        # Remove extra blank lines
+        pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
+        
         with open(RSS_FILE, 'wb') as f:
-            tree.write(f, encoding='utf-8', xml_declaration=True)
+            f.write(pretty_xml.encode('utf-8'))
+        
         logger.info(f"Fallback RSS feed written to {RSS_FILE}")
         return True
     except Exception as e:
@@ -608,22 +659,19 @@ async def generate_rss_feed():
                 anime_info = search_results[0]
                 anime_session = anime_info['session']
                 
-                # Get episode list
-                episode_data = await get_episode_list(anime_session)
-                if not episode_data or 'data' not in episode_data:
-                    logger.error(f"Failed to get episode list for {anime_title}")
-                    continue
-                
-                # Find the specific episode
-                episodes = episode_data['data']
-                target_episode = None
-                for ep in episodes:
-                    if int(ep['episode']) == episode_number:
-                        target_episode = ep
-                        break
-                
+                # Find the specific episode across multiple pages
+                target_episode = await get_episode_by_number(anime_session, episode_number)
                 if not target_episode:
-                    logger.error(f"Episode {episode_number} not found for {anime_title}")
+                    logger.error(f"Episode {episode_number} not found for {anime_title} (checked multiple pages)")
+                    # Add as basic item
+                    item = ET.SubElement(channel, "item")
+                    ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
+                    ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime_session}"
+                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "pubDate").text = datetime.now(
+                        pytz.timezone("Asia/Kolkata")
+                    ).strftime("%a, %d %b %Y %H:%M:%S %z")
+                    ET.SubElement(item, "guid").text = release_key
                     continue
                 
                 episode_session = target_episode['session']
@@ -650,16 +698,23 @@ async def generate_rss_feed():
                         for link in download_links:
                             if quality in link['text']:
                                 try:
-                                    kwik_link = extract_kwik_link(link['href'])
+                                    # Check if the link is already a kwik link
+                                    kwik_link = link['href']
+                                    if not re.match(r'https://kwik\.si/f/[\w\d-]+', kwik_link):
+                                        kwik_link = extract_kwik_link(link['href'])
+                                    
                                     if kwik_link:
                                         # Try to get direct link
                                         direct_link = get_dl_link(kwik_link)
                                         quality_links[quality] = direct_link or kwik_link
+                                        logger.info(f"Found {quality} link: {quality_links[quality]}")
                                         break
                                 except Exception as e:
                                     logger.error(f"Error getting {quality} link: {str(e)}")
                                     # Use kwik link as fallback
-                                    kwik_link = extract_kwik_link(link['href'])
+                                    kwik_link = link['href']
+                                    if not re.match(r'https://kwik\.si/f/[\w\d-]+', kwik_link):
+                                        kwik_link = extract_kwik_link(link['href'])
                                     if kwik_link:
                                         quality_links[quality] = kwik_link
                                         break
@@ -685,7 +740,7 @@ async def generate_rss_feed():
                     ET.SubElement(item, "pubDate").text = datetime.now(
                         pytz.timezone("Asia/Kolkata")
                     ).strftime("%a, %d %b %Y %H:%M:%S %z")
-                    ET.SubElement(item, "author").text = "AnimePahe"
+                    ET.SubElement(item, "author").text = "Blakite_Ravii"
                     ET.SubElement(item, "guid").text = primary_link or release_key
                     
                     processed_count += 1
@@ -710,17 +765,19 @@ async def generate_rss_feed():
                 logger.error(f"Error processing {anime_title} Episode {episode_number}: {str(e)}")
                 continue
         
-        # Write RSS feed to file
-        try:
-            tree = ET.ElementTree(rss)
-            with open(RSS_FILE, 'wb') as f:
-                tree.write(f, encoding='utf-8', xml_declaration=True)
-            logger.info(f"RSS feed written to {RSS_FILE}")
-            return True
-        except Exception as e:
-            logger.error(f"Error writing RSS feed to file: {str(e)}")
-            return create_fallback_rss()
-    
+        # Pretty print the XML
+        rough_string = ET.tostring(rss, 'utf-8')
+        reparsed = minidom.parseString(rough_string)
+        pretty_xml = reparsed.toprettyxml(indent="  ")
+        
+        # Remove extra blank lines
+        pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
+        
+        with open(RSS_FILE, 'wb') as f:
+            f.write(pretty_xml.encode('utf-8'))
+        
+        logger.info(f"RSS feed written to {RSS_FILE}")
+        return True
     except Exception as e:
         logger.error(f"Error generating RSS feed: {str(e)}")
         return create_fallback_rss()
