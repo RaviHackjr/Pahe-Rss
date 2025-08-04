@@ -410,6 +410,12 @@ def extract_kwik_link(url):
             return matches[0]
         
         # If we get here, we didn't find a kwik link
+        # Let's check if the URL is a pahe.win URL that redirects to a kwik link
+        if 'pahe.win' in url:
+            logger.info(f"URL is a pahe.win URL: {url}")
+            # Sometimes pahe.win URLs are direct download links, so we'll use them as is
+            return url
+        
         logger.warning(f"No kwik link found in response from {url}. Final URL: {final_url}")
         return None
     except Exception as e:
@@ -856,11 +862,13 @@ def main():
     scraper = create_scraper()
     session = create_session()
     
-    # Generate initial RSS feed
+    # Generate initial RSS feed to ensure health check passes
+    logger.info("Generating initial RSS feed...")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(generate_rss_feed())
+        logger.info("Initial RSS feed generated successfully")
     except Exception as e:
         logger.error(f"Initial RSS feed generation failed: {str(e)}")
         create_fallback_rss()
@@ -870,8 +878,13 @@ def main():
     # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
+    logger.info("Flask server started")
+    
+    # Give Flask server time to start
+    time.sleep(3)
     
     # Start RSS update loop
+    logger.info("Starting RSS update loop...")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
