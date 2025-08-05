@@ -172,7 +172,7 @@ async def get_episode_list(session_id: str, page: int = 1) -> dict:
     
     async with aiohttp.ClientSession() as aio_session:
         try:
-            async with aio_session.get(episodes_url, headers=HEADERS) as response:
+            async with aiohttp.get(episodes_url, headers=HEADERS) as response:
                 response.raise_for_status()
                 data = await response.json()
                 logger.info(f"Retrieved episode list for session {session_id}, page {page}")
@@ -688,6 +688,16 @@ def create_fallback_rss():
         logger.error(f"Error writing fallback RSS feed: {str(e)}")
         return False
 
+def prettify_xml(element):
+    """Return a pretty-printed XML string for the Element."""
+    rough_string = ET.tostring(element, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    # Remove extra blank lines and ensure proper indentation
+    pretty_xml = reparsed.toprettyxml(indent="  ")
+    # Remove the XML declaration that minidom adds
+    pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
+    return pretty_xml
+
 async def generate_rss_feed():
     """Generate RSS feed with the latest anime releases"""
     global previous_releases
@@ -871,12 +881,7 @@ async def generate_rss_feed():
                 continue
         
         # Pretty print the XML
-        rough_string = ET.tostring(rss, 'utf-8')
-        reparsed = minidom.parseString(rough_string)
-        pretty_xml = reparsed.toprettyxml(indent="  ")
-        
-        # Remove extra blank lines
-        pretty_xml = '\n'.join([line for line in pretty_xml.split('\n') if line.strip()])
+        pretty_xml = prettify_xml(rss)
         
         with open(RSS_FILE, 'wb') as f:
             f.write(pretty_xml.encode('utf-8'))
