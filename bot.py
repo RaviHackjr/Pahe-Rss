@@ -75,6 +75,7 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 # Global session with proper cookie handling
 session = None
 scraper = None
+kwik_scraper = None  # Dedicated scraper for kwik/pahe links
 
 def create_scraper():
     """Create a cloudscraper session with proper configuration"""
@@ -97,6 +98,43 @@ def create_scraper():
         logger.error(f"Failed to initialize cloudscraper session: {str(e)}")
     
     return scraper
+
+def create_kwik_scraper():
+    """Create a dedicated cloudscraper session for kwik/pahe links"""
+    global kwik_scraper
+    kwik_scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+        interpreter='nodejs'
+    )
+    
+    # Set specific headers for kwik/pahe
+    kwik_headers = {
+        'authority': 'pahe.win',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'accept-language': 'en-US,en;q=0.9',
+        'cache-control': 'max-age=0',
+        'sec-ch-ua': '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    }
+    kwik_scraper.headers.update(kwik_headers)
+    
+    # Initialize session by visiting the main page
+    try:
+        response = kwik_scraper.get("https://pahe.win/")
+        response.raise_for_status()
+        logger.info("Kwik scraper session initialized successfully")
+        time.sleep(random.uniform(1, 2))
+    except Exception as e:
+        logger.error(f"Failed to initialize kwik scraper session: {str(e)}")
+    
+    return kwik_scraper
 
 def create_session():
     """Create a requests session with proper headers and cookies"""
@@ -172,12 +210,20 @@ def step_1(data, key, load, seperator):
 
 def get_dl_link(link):
     """Get direct download link from kwik link"""
+    global kwik_scraper
+    if kwik_scraper is None:
+        kwik_scraper = create_kwik_scraper()
+    
     try:
-        # Use cloudscraper to bypass Cloudflare protection
-        local_scraper = cloudscraper.create_scraper()
+        # Add random delay to avoid rate limiting
+        time.sleep(random.uniform(1, 2))
+        
+        # Set referer header
+        local_headers = kwik_scraper.headers.copy()
+        local_headers['referer'] = link
         
         # First request to get the page
-        resp = local_scraper.get(link)
+        resp = kwik_scraper.get(link, headers=local_headers)
         
         # Extract the JavaScript code that contains the parameters
         pattern = r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
@@ -202,14 +248,14 @@ def get_dl_link(link):
         headers = {'referer': link}
         
         # Make the POST request
-        resp = local_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=False)
+        resp = kwik_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=False)
         
         # Check if we have a location header
         if 'location' in resp.headers:
             return resp.headers["location"]
         
         # If no location header, try with redirects enabled
-        resp = local_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=True)
+        resp = kwik_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=True)
         
         # Check if we got a redirect to a different domain
         if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
@@ -253,22 +299,25 @@ def get_dl_link(link):
     wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
-def extract_kwik_link(url):
+def extract_kwik_link(url, referer_url=None):
     """Extract kwik link from download page using cloudscraper"""
-    global scraper
-    if scraper is None:
-        scraper = create_scraper()
+    global kwik_scraper
+    if kwik_scraper is None:
+        kwik_scraper = create_kwik_scraper()
     
     try:
         # Add random delay to avoid rate limiting
         time.sleep(random.uniform(1, 2))
         
-        # Set referer header to the animepahe page
-        local_headers = HEADERS.copy()
-        local_headers['referer'] = 'https://animepahe.ru/'
+        # Set headers
+        local_headers = kwik_scraper.headers.copy()
+        if referer_url:
+            local_headers['referer'] = referer_url
+        else:
+            local_headers['referer'] = 'https://animepahe.ru/'
         
         # Use cloudscraper to get the page
-        response = scraper.get(url, headers=local_headers)
+        response = kwik_scraper.get(url, headers=local_headers)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -301,7 +350,7 @@ def extract_kwik_link(url):
         logger.error(f"Error extracting kwik link: {str(e)}")
         raise
 
-def get_episode_direct_urls(anime_title, episode_number, episode_session, quality_links):
+def get_episode_direct_urls(anime_title, episode_number, episode_session, quality_links, episode_url):
     """Get direct download URLs for all qualities of an episode"""
     episode_urls = {}
     for quality_link in quality_links:
@@ -313,7 +362,7 @@ def get_episode_direct_urls(anime_title, episode_number, episode_session, qualit
         
         # Get direct download link
         try:
-            kwik_link = extract_kwik_link(quality_link['href'])
+            kwik_link = extract_kwik_link(quality_link['href'], referer_url=episode_url)
             if not kwik_link:
                 continue
             
@@ -717,7 +766,8 @@ async def generate_rss_feed():
                     
                     # Get direct URLs for all qualities
                     episode_urls = get_episode_direct_urls(
-                        anime_title, episode_number, episode_session, download_links
+                        anime_title, episode_number, episode_session, download_links, 
+                        f"https://animepahe.ru/play/{anime_session}/{episode_session}"
                     )
                     
                     # Create RSS item
@@ -853,9 +903,10 @@ def main():
     create_initial_rss()
     
     # Initialize session
-    global scraper, session
+    global scraper, session, kwik_scraper
     scraper = create_scraper()
     session = create_session()
+    kwik_scraper = create_kwik_scraper()
     
     # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
