@@ -174,10 +174,10 @@ def get_dl_link(link):
     """Get direct download link from kwik link"""
     try:
         # Use cloudscraper to bypass Cloudflare protection
-        scraper = cloudscraper.create_scraper()
+        local_scraper = cloudscraper.create_scraper()
         
         # First request to get the page
-        resp = scraper.get(link)
+        resp = local_scraper.get(link)
         
         # Extract the JavaScript code that contains the parameters
         pattern = r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
@@ -202,14 +202,14 @@ def get_dl_link(link):
         headers = {'referer': link}
         
         # Make the POST request
-        resp = scraper.post(url=post_url, data=data, headers=headers, allow_redirects=False)
+        resp = local_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=False)
         
         # Check if we have a location header
         if 'location' in resp.headers:
             return resp.headers["location"]
         
         # If no location header, try with redirects enabled
-        resp = scraper.post(url=post_url, data=data, headers=headers, allow_redirects=True)
+        resp = local_scraper.post(url=post_url, data=data, headers=headers, allow_redirects=True)
         
         # Check if we got a redirect to a different domain
         if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
@@ -248,21 +248,58 @@ def get_dl_link(link):
         logger.error(f"Error getting direct link: {str(e)}")
         return None
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
+    reraise=True
+)
 def extract_kwik_link(url):
-    """Extract kwik link from download page"""
+    """Extract kwik link from download page using cloudscraper"""
+    global scraper
+    if scraper is None:
+        scraper = create_scraper()
+    
     try:
-        response = requests.get(url, headers=HEADERS)
+        # Add random delay to avoid rate limiting
+        time.sleep(random.uniform(1, 2))
+        
+        # Set referer header to the animepahe page
+        local_headers = HEADERS.copy()
+        local_headers['referer'] = 'https://animepahe.ru/'
+        
+        # Use cloudscraper to get the page
+        response = scraper.get(url, headers=local_headers)
         response.raise_for_status()
+        
         soup = BeautifulSoup(response.text, 'html.parser')
         script_tags = soup.find_all('script', type="text/javascript")
+        
         for script in script_tags:
+            # Look for kwik.si links
             match = re.search(r'https://kwik\.si/f/[\w\d]+', script.text)
             if match:
                 return match.group(0)
+            
+            # Also check for pahe.win links
+            match = re.search(r'https://pahe\.win/[\w\d]+', script.text)
+            if match:
+                # Convert pahe.win link to kwik.si
+                pahe_link = match.group(0)
+                logger.info(f"Found pahe.win link, converting to kwik.si: {pahe_link}")
+                return pahe_link.replace('pahe.win', 'kwik.si')
+        
+        # If we didn't find it in scripts, check for any direct links
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if 'kwik.si/f/' in href or 'pahe.win/' in href:
+                if 'pahe.win/' in href:
+                    href = href.replace('pahe.win', 'kwik.si')
+                return href
+        
         return None
     except Exception as e:
         logger.error(f"Error extracting kwik link: {str(e)}")
-        return None
+        raise
 
 def get_episode_direct_urls(anime_title, episode_number, episode_session, quality_links):
     """Get direct download URLs for all qualities of an episode"""
@@ -275,13 +312,17 @@ def get_episode_direct_urls(anime_title, episode_number, episode_session, qualit
         resolution = resolution_match.group(1)
         
         # Get direct download link
-        kwik_link = extract_kwik_link(quality_link['href'])
-        if not kwik_link:
+        try:
+            kwik_link = extract_kwik_link(quality_link['href'])
+            if not kwik_link:
+                continue
+            
+            direct_link = get_dl_link(kwik_link)
+            if direct_link:
+                episode_urls[resolution] = direct_link
+        except Exception as e:
+            logger.error(f"Error getting direct URL for {resolution}: {str(e)}")
             continue
-        
-        direct_link = get_dl_link(kwik_link)
-        if direct_link:
-            episode_urls[resolution] = direct_link
     
     return episode_urls
 
@@ -297,7 +338,7 @@ async def search_anime(query: str) -> list:
     
     async with aiohttp.ClientSession() as aio_session:
         try:
-            async with aio_session.get(search_url, headers=HEADERS) as response:  # Fixed: using aio_session.get
+            async with aio_session.get(search_url, headers=HEADERS) as response:
                 response.raise_for_status()
                 data = await response.json()
                 
@@ -321,7 +362,7 @@ async def get_episode_list(session_id: str, page: int = 1) -> dict:
     
     async with aiohttp.ClientSession() as aio_session:
         try:
-            async with aio_session.get(episodes_url, headers=HEADERS) as response:  # Fixed: using aio_session.get
+            async with aio_session.get(episodes_url, headers=HEADERS) as response:
                 response.raise_for_status()
                 data = await response.json()
                 logger.info(f"Retrieved episode list for session {session_id}, page {page}")
