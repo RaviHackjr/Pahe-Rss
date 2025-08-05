@@ -136,7 +136,7 @@ def save_cached_releases(releases):
     except Exception as e:
         logger.error(f"Error saving cache: {str(e)}")
 
-# Helper functions for kwik link processing (from the provided script)
+# Helper functions for kwik link processing
 def step_2(s, seperator, base=10):
     """Step 2 of kwik link processing"""
     mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
@@ -297,7 +297,7 @@ async def search_anime(query: str) -> list:
     
     async with aiohttp.ClientSession() as aio_session:
         try:
-            async with aio_session.get(search_url, headers=HEADERS) as response:
+            async with aio_session.get(search_url, headers=HEADERS) as response:  # Fixed: using aio_session.get
                 response.raise_for_status()
                 data = await response.json()
                 
@@ -321,7 +321,7 @@ async def get_episode_list(session_id: str, page: int = 1) -> dict:
     
     async with aiohttp.ClientSession() as aio_session:
         try:
-            async with aiohttp.get(episodes_url, headers=HEADERS) as response:
+            async with aio_session.get(episodes_url, headers=HEADERS) as response:  # Fixed: using aio_session.get
                 response.raise_for_status()
                 data = await response.json()
                 logger.info(f"Retrieved episode list for session {session_id}, page {page}")
