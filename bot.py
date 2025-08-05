@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AnimePahe RSS Feed Generator with Multi-Quality Support
-Generates an RSS feed for the latest 25 anime releases from AnimePahe with 360p, 720p, and 1080p links
+AnimePahe RSS Feed Generator with Direct Download URLs
+Generates an RSS feed for the latest 25 anime releases from AnimePahe with direct download links
 Designed for Koyeb deployment with auto-updates every 30-60 seconds, maintaining 25 items with newest at top
 """
 import logging
@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import cloudscraper
 from flask import Flask, send_file, Response
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Flask app setup
 app = Flask(__name__)
 
-# Headers for requests (from working bot)
+# Headers for requests
 HEADERS = {
     'authority': 'animepahe.ru',
     'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -63,15 +64,13 @@ BASE_DIR = Path(__file__).parent.resolve()
 RSS_FILE = BASE_DIR / "animepahe_feed.xml"
 CACHE_FILE = BASE_DIR / "animepahe_cache.json"
 QUALITY_PREFERENCES = ["360p", "720p", "1080p"]
-UPDATE_INTERVAL_MIN = 30  # seconds (increased to avoid rate limits)
+UPDATE_INTERVAL_MIN = 30  # seconds
 UPDATE_INTERVAL_MAX = 60  # seconds
 MAX_ITEMS = 25  # Maximum number of items in RSS feed
+MAX_WORKERS = 4  # Number of simultaneous processing
 
 # Create directories
 BASE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Store previous releases to detect new episodes
-previous_releases = set()
 
 # Global session with proper cookie handling
 session = None
@@ -93,7 +92,7 @@ def create_scraper():
         response = scraper.get("https://animepahe.ru/")
         response.raise_for_status()
         logger.info("Cloudscraper session initialized successfully")
-        time.sleep(random.uniform(1, 2))  # Reduced delay for faster startup
+        time.sleep(random.uniform(1, 2))
     except Exception as e:
         logger.error(f"Failed to initialize cloudscraper session: {str(e)}")
     
@@ -110,7 +109,7 @@ def create_session():
         response = session.get("https://animepahe.ru/")
         response.raise_for_status()
         logger.info("Session initialized successfully")
-        time.sleep(random.uniform(1, 2))  # Reduced delay for faster startup
+        time.sleep(random.uniform(1, 2))
     except Exception as e:
         logger.error(f"Failed to initialize session: {str(e)}")
     
@@ -137,6 +136,156 @@ def save_cached_releases(releases):
     except Exception as e:
         logger.error(f"Error saving cache: {str(e)}")
 
+# Helper functions for kwik link processing (from the provided script)
+def step_2(s, seperator, base=10):
+    """Step 2 of kwik link processing"""
+    mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+    numbers = mapped_range[0:base]
+    max_iter = 0
+    for index, value in enumerate(s[::-1]):
+        max_iter += int(value if value.isdigit() else 0) * (seperator**index)
+    mid = ''
+    while max_iter > 0:
+        mid = numbers[int(max_iter % base)] + mid
+        max_iter = (max_iter - (max_iter % base)) / base
+    return mid or '0'
+
+def step_1(data, key, load, seperator):
+    """Step 1 of kwik link processing"""
+    payload = ""
+    i = 0
+    seperator = int(seperator)
+    load = int(load)
+    while i < len(data):
+        s = ""
+        while data[i] != key[seperator]:
+            s += data[i]
+            i += 1
+        for index, value in enumerate(key):
+            s = s.replace(value, str(index))
+        payload += chr(int(step_2(s, seperator, 10)) - load)
+        i += 1
+    payload = re.findall(
+        r'action="([^\"]+)" method="POST"><input type="hidden" name="_token"\s+value="([^\"]+)', payload
+    )[0]
+    return payload
+
+def get_dl_link(link):
+    """Get direct download link from kwik link"""
+    try:
+        # Use cloudscraper to bypass Cloudflare protection
+        scraper = cloudscraper.create_scraper()
+        
+        # First request to get the page
+        resp = scraper.get(link)
+        
+        # Extract the JavaScript code that contains the parameters
+        pattern = r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
+        match = re.search(pattern, resp.text)
+        if not match:
+            # Try alternative pattern
+            pattern = r'\("([^"]+)",(\d+),"([^"]+)",(\d+),(\d+)'
+            match = re.search(pattern, resp.text)
+            if match:
+                data, _, key, load, seperator = match.groups()
+            else:
+                return None
+        else:
+            data, key, load, seperator = match.groups()
+        
+        # Process the parameters
+        url, token = step_1(data=data, key=key, load=load, seperator=seperator)
+        
+        # Prepare the POST request
+        post_url = url if url.startswith('http') else f"https://kwik.si{url}"
+        data = {"_token": token}
+        headers = {'referer': link}
+        
+        # Make the POST request
+        resp = scraper.post(url=post_url, data=data, headers=headers, allow_redirects=False)
+        
+        # Check if we have a location header
+        if 'location' in resp.headers:
+            return resp.headers["location"]
+        
+        # If no location header, try with redirects enabled
+        resp = scraper.post(url=post_url, data=data, headers=headers, allow_redirects=True)
+        
+        # Check if we got a redirect to a different domain
+        if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
+            return resp.url
+        
+        # If we get a 200 response, check if it contains a direct link
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # Look for download link
+            download_link = soup.find('a', {'id': 'download'})
+            if download_link and 'href' in download_link.attrs:
+                return download_link['href']
+            
+            # Look for any link that ends with .mp4
+            for a in soup.find_all('a', href=True):
+                if a['href'].endswith('.mp4'):
+                    return a['href']
+            
+            # Look for any script that contains a direct link
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string:
+                    # Look for URLs in the script
+                    urls = re.findall(r'https?://[^\s"\'<>]+', script.string)
+                    for url in urls:
+                        if url.endswith('.mp4'):
+                            return url
+        
+        # If all else fails, try to extract from the final URL
+        if resp.url and resp.url != link:
+            return resp.url
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error getting direct link: {str(e)}")
+        return None
+
+def extract_kwik_link(url):
+    """Extract kwik link from download page"""
+    try:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tags = soup.find_all('script', type="text/javascript")
+        for script in script_tags:
+            match = re.search(r'https://kwik\.si/f/[\w\d]+', script.text)
+            if match:
+                return match.group(0)
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting kwik link: {str(e)}")
+        return None
+
+def get_episode_direct_urls(anime_title, episode_number, episode_session, quality_links):
+    """Get direct download URLs for all qualities of an episode"""
+    episode_urls = {}
+    for quality_link in quality_links:
+        # Extract quality info
+        resolution_match = re.search(r"\b(\d{3,4}p\b)", quality_link['text'])
+        if not resolution_match:
+            continue
+        resolution = resolution_match.group(1)
+        
+        # Get direct download link
+        kwik_link = extract_kwik_link(quality_link['href'])
+        if not kwik_link:
+            continue
+        
+        direct_link = get_dl_link(kwik_link)
+        if direct_link:
+            episode_urls[resolution] = direct_link
+    
+    return episode_urls
+
+# AnimePahe API functions
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=4, max=10),
@@ -203,39 +352,6 @@ async def get_episode_by_number(anime_session, episode_number, max_pages=5):
             break
     
     return None
-
-def step_2(s, seperator, base=10):
-    """Helper function for kwik link extraction"""
-    mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
-    numbers = mapped_range[0:base]
-    max_iter = 0
-    for index, value in enumerate(s[::-1]):
-        max_iter += int(value if value.isdigit() else 0) * (seperator**index)
-    mid = ''
-    while max_iter > 0:
-        mid = numbers[int(max_iter % base)] + mid
-        max_iter = (max_iter - (max_iter % base)) / base
-    return mid or '0'
-
-def step_1(data, key, load, seperator):
-    """Helper function for kwik link extraction"""
-    payload = ""
-    i = 0
-    seperator = int(seperator)
-    load = int(load)
-    while i < len(data):
-        s = ""
-        while data[i] != key[seperator]:
-            s += data[i]
-            i += 1
-        for index, value in enumerate(key):
-            s = s.replace(value, str(index))
-        payload += chr(int(step_2(s, seperator, 10)) - load)
-        i += 1
-    payload = re.findall(
-        r'action="([^\"]+)" method="POST"><input type="hidden" name="_token"\s+value="([^\"]+)', payload
-    )[0]
-    return payload
 
 @retry(
     stop=stop_after_attempt(3),
@@ -334,254 +450,6 @@ def get_download_links(anime_session, episode_session):
     wait=wait_exponential(multiplier=2, min=4, max=10),
     reraise=True
 )
-def extract_kwik_link(url):
-    """Extract kwik.si link from download page"""
-    global scraper
-    if scraper is None:
-        scraper = create_scraper()
-    
-    # Check if the URL is already a kwik link
-    kwik_pattern = r'https://kwik\.si/f/[\w\d-]+'
-    if re.match(kwik_pattern, url):
-        logger.info(f"URL is already a kwik link: {url}")
-        return url
-    
-    try:
-        # Add random delay
-        time.sleep(random.uniform(1, 2))  # Reduced delay for faster processing
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-            'Referer': 'https://animepahe.ru/'
-        }
-        
-        response = scraper.get(url, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-        
-        logger.info(f"Got response from {url}, status code: {response.status_code}")
-        
-        # Check if the final URL is a kwik link
-        final_url = response.url
-        if re.match(kwik_pattern, final_url):
-            logger.info(f"Final URL is a kwik link: {final_url}")
-            return final_url
-        
-        # Try html5lib first (more reliable for complex pages)
-        for parser in ['html5lib', 'html.parser']:
-            try:
-                soup = BeautifulSoup(response.text, parser)
-                break
-            except Exception as e:
-                logger.warning(f"Parser {parser} failed: {str(e)}")
-                continue
-        
-        # Look for the kwik link in script tags
-        for script in soup.find_all('script'):
-            if script.string:
-                match = re.search(kwik_pattern, script.string)
-                if match:
-                    logger.info(f"Found kwik link in script: {match.group(0)}")
-                    return match.group(0)
-        
-        # Look for download elements
-        download_elements = soup.select('a[href*="kwik.si"], a[onclick*="kwik.si"]')
-        for element in download_elements:
-            href = element.get('href') or element.get('onclick', '')
-            match = re.search(kwik_pattern, href)
-            if match:
-                logger.info(f"Found kwik link in element: {match.group(0)}")
-                return match.group(0)
-        
-        # Look in the whole page text
-        page_text = str(soup)
-        matches = re.findall(kwik_pattern, page_text)
-        if matches:
-            logger.info(f"Found kwik link in page text: {matches[0]}")
-            return matches[0]
-        
-        # If we get here, we didn't find a kwik link
-        # Let's check if the URL is a pahe.win URL that redirects to a kwik link
-        if 'pahe.win' in url:
-            logger.info(f"URL is a pahe.win URL: {url}")
-            # Sometimes pahe.win URLs are direct download links, so we'll use them as is
-            return url
-        
-        logger.warning(f"No kwik link found in response from {url}. Final URL: {final_url}")
-        return None
-    except Exception as e:
-        logger.error(f"Error extracting kwik link: {str(e)}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
-    reraise=True
-)
-def get_dl_link(link):
-    """Get direct download link from kwik.si or pahe.win"""
-    global scraper
-    if scraper is None:
-        scraper = create_scraper()
-    
-    try:
-        # Add random delay to avoid rate limiting
-        time.sleep(random.uniform(1, 2))  # Reduced delay for faster processing
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
-        }
-        
-        # First, get the main page to establish session
-        scraper.get("https://animepahe.ru/", headers=headers)
-        
-        # Handle different URL types
-        if 'kwik.si' in link:
-            # Kwik.si handling
-            resp = scraper.get(link, headers=headers)
-            
-            # Try different patterns to extract the parameters
-            patterns = [
-                r'\("([^"]+)",(\d+),"([^"]+)",(\d+),(\d+)',
-                r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
-            ]
-            
-            match = None
-            for pattern in patterns:
-                match = re.search(pattern, resp.text)
-                if match:
-                    break
-            
-            if not match:
-                logger.error(f"Could not find required pattern in response from {link}")
-                return None
-            
-            # Extract parameters based on the pattern matched
-            if len(match.groups()) == 5:
-                data, _, key, load, seperator = match.groups()
-            else:
-                data, key, load, seperator = match.groups()
-            
-            # Process the parameters
-            url, token = step_1(data=data, key=key, load=load, seperator=seperator)
-            
-            # Prepare the POST request
-            post_url = url if url.startswith('http') else f"https://kwik.si{url}"
-            data = {"_token": token}
-            post_headers = {
-                'referer': link,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Origin': 'https://kwik.si'
-            }
-            
-            # Make the POST request
-            resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=False)
-            
-            # Check for redirect in headers
-            if 'location' in resp.headers:
-                logger.info(f"Found redirect to: {resp.headers['location']}")
-                return resp.headers["location"]
-            
-            # If no redirect, follow redirects manually
-            resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=True)
-            
-            # Check if the final URL is different from the post URL
-            if resp.url != post_url and not resp.url.startswith('https://kwik.si/'):
-                logger.info(f"Final URL after POST: {resp.url}")
-                return resp.url
-            
-            return None
-        
-        elif 'pahe.win' in link:
-            # Pahe.win handling
-            logger.info(f"Processing pahe.win URL: {link}")
-            
-            # Make request to pahe.win URL
-            resp = scraper.get(link, headers=headers, allow_redirects=True)
-            
-            # Check if we were redirected to a direct download URL
-            final_url = resp.url
-            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv']
-            
-            if any(final_url.lower().endswith(ext) for ext in video_extensions):
-                logger.info(f"Found direct download URL in redirect: {final_url}")
-                return final_url
-            
-            # Parse the page to find direct download links
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Look for direct download links in the page
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if any(href.lower().endswith(ext) for ext in video_extensions):
-                    logger.info(f"Found direct download URL in link: {href}")
-                    return href
-            
-            # Look for forms that might lead to direct downloads
-            forms = soup.find_all('form')
-            for form in forms:
-                action = form.get('action')
-                if action and any(action.lower().endswith(ext) for ext in video_extensions):
-                    logger.info(f"Found direct download URL in form action: {action}")
-                    return action
-                
-                # If form action is not a direct URL, try submitting the form
-                if action and action.startswith('http'):
-                    inputs = form.find_all('input')
-                    data = {}
-                    for input_tag in inputs:
-                        name = input_tag.get('name')
-                        value = input_tag.get('value', '')
-                        if name:
-                            data[name] = value
-                    
-                    try:
-                        form_resp = scraper.post(action, data=data, headers=headers, allow_redirects=False)
-                        if 'location' in form_resp.headers:
-                            redirect_url = form_resp.headers['location']
-                            if any(redirect_url.lower().endswith(ext) for ext in video_extensions):
-                                logger.info(f"Found direct download URL after form submission: {redirect_url}")
-                                return redirect_url
-                    except Exception as e:
-                        logger.error(f"Error submitting form: {str(e)}")
-            
-            # If we can't find a direct download URL, return the original pahe.win URL
-            logger.warning(f"Could not find direct download URL for pahe.win link: {link}")
-            return link
-        
-        else:
-            logger.warning(f"Unknown URL type: {link}")
-            return None
-        
-    except Exception as e:
-        logger.error(f"Error getting direct link: {str(e)}")
-        raise
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
-    reraise=True
-)
 def get_latest_releases(page=1):
     """Get latest anime releases"""
     global scraper
@@ -613,7 +481,7 @@ def create_initial_rss():
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = "AnimePahe Latest Releases"
     ET.SubElement(channel, "link").text = "https://animepahe.ru"
-    ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with 360p, 720p, and 1080p download links (Initializing...)"
+    ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with direct download links (Initializing...)"
     ET.SubElement(channel, "language").text = "en-us"
     ET.SubElement(channel, "lastBuildDate").text = datetime.now(
         pytz.timezone("Asia/Kolkata")
@@ -700,7 +568,6 @@ def prettify_xml(element):
 
 async def generate_rss_feed():
     """Generate RSS feed with the latest anime releases"""
-    global previous_releases
     logger.info("Generating RSS feed with latest anime releases...")
     
     try:
@@ -723,7 +590,7 @@ async def generate_rss_feed():
         # Channel metadata
         ET.SubElement(channel, "title").text = "AnimePahe Latest Releases"
         ET.SubElement(channel, "link").text = "https://animepahe.ru"
-        ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with 360p, 720p, and 1080p download links"
+        ET.SubElement(channel, "description").text = "Latest anime releases from AnimePahe with direct download links"
         ET.SubElement(channel, "language").text = "en-us"
         ET.SubElement(channel, "lastBuildDate").text = datetime.now(
             pytz.timezone("Asia/Kolkata")
@@ -807,47 +674,27 @@ async def generate_rss_feed():
                         ET.SubElement(item, "guid").text = release_key
                         continue
                     
-                    # Find links for each quality
-                    quality_links = {}
-                    for quality in QUALITY_PREFERENCES:
-                        for link in download_links:
-                            if quality in link['text']:
-                                try:
-                                    # Check if the link is already a kwik link
-                                    kwik_link = link['href']
-                                    if not re.match(r'https://kwik\.si/f/[\w\d-]+', kwik_link):
-                                        kwik_link = extract_kwik_link(link['href'])
-                                    
-                                    if kwik_link:
-                                        # Try to get direct link
-                                        direct_link = get_dl_link(kwik_link)
-                                        quality_links[quality] = direct_link or kwik_link
-                                        logger.info(f"Found {quality} link: {quality_links[quality]}")
-                                        break
-                                except Exception as e:
-                                    logger.error(f"Error getting {quality} link: {str(e)}")
-                                    # Use kwik link as fallback
-                                    kwik_link = link['href']
-                                    if not re.match(r'https://kwik\.si/f/[\w\d-]+', kwik_link):
-                                        kwik_link = extract_kwik_link(link['href'])
-                                    if kwik_link:
-                                        quality_links[quality] = kwik_link
-                                        break
+                    # Get direct URLs for all qualities
+                    episode_urls = get_episode_direct_urls(
+                        anime_title, episode_number, episode_session, download_links
+                    )
                     
                     # Create RSS item
                     item = ET.SubElement(channel, "item")
                     ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                     
                     # Use the best available quality as primary link
-                    primary_link = quality_links.get("1080p") or quality_links.get("720p") or quality_links.get("360p")
+                    primary_link = episode_urls.get("1080p") or episode_urls.get("720p") or episode_urls.get("360p")
                     ET.SubElement(item, "link").text = primary_link or f"https://animepahe.ru/anime/{anime_session}"
                     
-                    # Create description with all quality links
-                    description = f"Episode {episode_number} of {anime_title}\n\n"
-                    if quality_links:
-                        description += "Download Links:\n"
-                        for quality, link in quality_links.items():
-                            description += f"{quality}: {link}\n"
+                    # Create description with all quality links in the requested format
+                    description = f"{anime_title}\nEpisode {episode_number}\n"
+                    
+                    if episode_urls:
+                        # Sort qualities by resolution
+                        for quality in sorted(episode_urls.keys(), key=lambda x: int(x[:-1])):
+                            url = episode_urls[quality]
+                            description += f"{quality} - {url}\n"
                     else:
                         description += "Visit AnimePahe for download links"
                     
@@ -859,10 +706,10 @@ async def generate_rss_feed():
                     ET.SubElement(item, "guid").text = primary_link or release_key
                     
                     processed_count += 1
-                    logger.info(f"Added {anime_title} Episode {episode_number} with {len(quality_links)} quality links")
+                    logger.info(f"Added {anime_title} Episode {episode_number} with {len(episode_urls)} quality links")
                     
                     # Add delay between processing to avoid rate limits
-                    await asyncio.sleep(random.uniform(1, 2))  # Reduced delay for faster processing
+                    await asyncio.sleep(random.uniform(1, 2))
                 
                 except Exception as e:
                     logger.error(f"Error processing download links for {anime_title} Episode {episode_number}: {str(e)}")
@@ -975,7 +822,7 @@ def main():
     logger.info("Flask server started")
     
     # Give Flask server time to start
-    time.sleep(1)  # Reduced delay for faster deployment
+    time.sleep(1)
     
     # Start RSS update loop
     logger.info("Starting RSS update loop...")
