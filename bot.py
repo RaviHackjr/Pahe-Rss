@@ -699,7 +699,7 @@ async def generate_rss_feed():
                 item = ET.SubElement(channel, "item")
                 ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                 ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
-                ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                 ET.SubElement(item, "pubDate").text = datetime.now(
                     pytz.timezone("Asia/Kolkata")
                 ).strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -721,7 +721,7 @@ async def generate_rss_feed():
                     item = ET.SubElement(channel, "item")
                     ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
-                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "pubDate").text = datetime.now(
                         pytz.timezone("Asia/Kolkata")
                     ).strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -739,7 +739,7 @@ async def generate_rss_feed():
                     item = ET.SubElement(channel, "item")
                     ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime_session}"
-                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "pubDate").text = datetime.now(
                         pytz.timezone("Asia/Kolkata")
                     ).strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -757,7 +757,7 @@ async def generate_rss_feed():
                         item = ET.SubElement(channel, "item")
                         ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                         ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime_session}"
-                        ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                        ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                         ET.SubElement(item, "pubDate").text = datetime.now(
                             pytz.timezone("Asia/Kolkata")
                         ).strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -778,18 +778,17 @@ async def generate_rss_feed():
                     primary_link = episode_urls.get("1080p") or episode_urls.get("720p") or episode_urls.get("360p")
                     ET.SubElement(item, "link").text = primary_link or f"https://animepahe.ru/anime/{anime_session}"
                     
-                    # Create description with all quality links in the requested format
-                    description = f"{anime_title}\nEpisode {episode_number}\n"
+                    # Create description with just the title and episode number
+                    ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                     
+                    # Add quality links as separate XML elements
                     if episode_urls:
                         # Sort qualities by resolution
                         for quality in sorted(episode_urls.keys(), key=lambda x: int(x[:-1])):
                             url = episode_urls[quality]
-                            description += f"{quality} - {url}\n"
-                    else:
-                        description += "Visit AnimePahe for download links"
+                            quality_element = ET.SubElement(item, quality)
+                            quality_element.text = url
                     
-                    ET.SubElement(item, "description").text = description
                     ET.SubElement(item, "pubDate").text = datetime.now(
                         pytz.timezone("Asia/Kolkata")
                     ).strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -808,7 +807,7 @@ async def generate_rss_feed():
                     item = ET.SubElement(channel, "item")
                     ET.SubElement(item, "title").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "link").text = f"https://animepahe.ru/anime/{anime.get('anime_session', '')}"
-                    ET.SubElement(item, "description").text = f"Episode {episode_number} of {anime_title} - Visit AnimePahe for download links"
+                    ET.SubElement(item, "description").text = f"{anime_title} Episode {episode_number}"
                     ET.SubElement(item, "pubDate").text = datetime.now(
                         pytz.timezone("Asia/Kolkata")
                     ).strftime("%a, %d %b %Y %H:%M:%S %z")
